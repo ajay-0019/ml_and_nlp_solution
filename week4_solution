@@ -1,1 +1,146 @@
+import torch
+import numpy as np
+from datasets import load_dataset
+from transformers import AutoTokenizer, AutoModelForCausalLM, TrainingArguments, Trainer, DataCollatorForLanguageModeling
+import os
+
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+MODEL_NAME = "gpt2"
+DATASET_NAME = "wikitext"
+DATASET_SUBSET = "wikitext-2-raw-v1"
+BLOCK_SIZE = 128
+TRAIN_BATCH_SIZE = 8
+EVAL_BATCH_SIZE = 8
+LEARNING_RATE = 2e-5
+NUM_EPOCHS = 1
+OUTPUT_DIR = "./gpt2-next-word-predictor"
+SEED = 42
+
+os.environ["TOKENIZERS_PARALLELISM"] = "false"
+
+raw_datasets = load_dataset(DATASET_NAME, DATASET_SUBSET)
+
+tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME)
+if tokenizer.pad_token is None:
+    tokenizer.pad_token = tokenizer.eos_token
+
+def tokenize_function(examples):
+    texts = [text if text is not None else "" for text in examples["text"]]
+    return tokenizer(texts, truncation=True, max_length=BLOCK_SIZE)
+
+tokenized_datasets = raw_datasets.map(
+    tokenize_function,
+    batched=True,
+    num_proc=1,
+    remove_columns=["text"],
+)
+
+def group_texts(examples):
+    concatenated_examples = {k: sum(examples[k], []) for k in examples.keys()}
+    total_length = (len(concatenated_examples[list(examples.keys())[0]]) // BLOCK_SIZE) * BLOCK_SIZE
+    result = {
+        k: [t[i: i + BLOCK_SIZE] for i in range(0, total_length, BLOCK_SIZE)]
+        for k, t in concatenated_examples.items()
+    }
+    result["labels"] = result["input_ids"].copy()
+    return result
+
+lm_datasets = tokenized_datasets.map(group_texts, batched=True, num_proc=1)
+lm_datasets = lm_datasets.filter(lambda x: len(x['input_ids']) > 0)
+
+train_dataset = lm_datasets["train"].select(range(min(10000, len(lm_datasets["train"]))))
+eval_dataset = lm_datasets["validation"].select(range(min(1000, len(lm_datasets["validation"]))))
+
+model = AutoModelForCausalLM.from_pretrained(MODEL_NAME).to(device)
+model.config.pad_token_id = tokenizer.pad_token_id
+
+data_collator = DataCollatorForLanguageModeling(tokenizer=tokenizer, mlm=False)
+
+training_args = TrainingArguments(
+    output_dir=OUTPUT_DIR,
+    eval_strategy="epoch",
+    learning_rate=LEARNING_RATE,
+    per_device_train_batch_size=TRAIN_BATCH_SIZE,
+    per_device_eval_batch_size=EVAL_BATCH_SIZE,
+    num_train_epochs=NUM_EPOCHS,
+    weight_decay=0.01,
+    save_total_limit=2,
+    save_strategy="epoch",
+    logging_dir=f"{OUTPUT_DIR}/logs",
+    logging_steps=100,
+    report_to="none",
+    push_to_hub=False,
+    seed=SEED,
+    fp16=torch.cuda.is_available(),
+)
+
+def compute_metrics(eval_preds):
+    preds, labels = eval_preds
+    logits = torch.tensor(preds).view(-1, preds.shape[-1]).to(device)
+    true_labels = torch.tensor(labels).view(-1).to(device)
+    mask = (true_labels != -100)
+    flat_logits = logits[mask]
+    flat_true_labels = true_labels[mask]
+    if flat_true_labels.numel() == 0:
+        return {"accuracy": 0.0, "top_5_accuracy": 0.0}
+    predicted_tokens = torch.argmax(flat_logits, dim=-1)
+    accuracy = (predicted_tokens == flat_true_labels).float().mean().item()
+    K = 5
+    top_k_preds = torch.topk(flat_logits, k=K, dim=-1).indices
+    top_k_accuracy = (top_k_preds == flat_true_labels.unsqueeze(-1)).any(dim=-1).float().mean().item()
+    return {"accuracy": accuracy, f"top_{K}_accuracy": top_k_accuracy}
+
+trainer = Trainer(
+    model=model,
+    args=training_args,
+    train_dataset=train_dataset,
+    eval_dataset=eval_dataset,
+    tokenizer=tokenizer,
+    data_collator=data_collator,
+    compute_metrics=compute_metrics,
+)
+
+trainer.train()
+
+eval_results = trainer.evaluate()
+perplexity = np.exp(eval_results["eval_loss"])
+
+model.save_pretrained(OUTPUT_DIR)
+tokenizer.save_pretrained(OUTPUT_DIR)
+
+loaded_model = AutoModelForCausalLM.from_pretrained(OUTPUT_DIR).to(device)
+loaded_tokenizer = AutoTokenizer.from_pretrained(OUTPUT_DIR)
+if loaded_tokenizer.pad_token is None:
+    loaded_tokenizer.pad_token = loaded_tokenizer.eos_token
+loaded_model.config.pad_token_id = loaded_tokenizer.pad_token_id
+
+def predict_next_word(prompt, model, tokenizer, num_beams=5, max_length_to_generate=20):
+    if not prompt.strip():
+        return "Prompt is empty. Please provide a valid input."
+    input_ids = tokenizer.encode(prompt, return_tensors="pt").to(model.device)
+    output = model.generate(
+        input_ids,
+        max_length=len(input_ids[0]) + max_length_to_generate,
+        num_beams=num_beams,
+        no_repeat_ngram_size=2,
+        early_stopping=True,
+        pad_token_id=tokenizer.pad_token_id,
+        eos_token_id=tokenizer.eos_token_id,
+        do_sample=False,
+    )
+    return tokenizer.decode(output[0], skip_special_tokens=True)
+
+prompt_text_1 = "The quick brown fox jumps over the"
+generated_sequence_1 = predict_next_word(prompt_text_1, loaded_model, loaded_tokenizer)
+
+prompt_text_2 = "Natural language processing is a field of"
+generated_sequence_2 = predict_next_word(prompt_text_2, loaded_model, loaded_tokenizer)
+
+prompt_text_3 = "The capital of France is"
+generated_sequence_3 = predict_next_word(prompt_text_3, loaded_model, loaded_tokenizer)
+
+print(generated_sequence_1)
+print(generated_sequence_2)
+print(generated_sequence_3)
 
